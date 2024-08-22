@@ -1,0 +1,118 @@
+import os
+import sys
+import numpy as np
+import argparse
+from PIL import Image
+import time
+import scipy.io as scio
+import torch
+import open3d as o3d
+from graspnetAPI.graspnet_eval import GraspGroup
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(ROOT_DIR)
+sys.path.append(os.path.join(ROOT_DIR, 'utils'))
+#from models.graspnet import GraspNet, pred_decode
+from dataset.graspnet_dataset import minkowski_collate_fn
+from collision_detector import ModelFreeCollisionDetector
+from data_utils import CameraInfo, create_point_cloud_from_depth_image, get_workspace_mask
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset_root', default='./data3/graspnet')
+parser.add_argument('--checkpoint_path', default='./data3/graspnet/logs/log_kn/minkuresunet_epoch100.tar')
+parser.add_argument('--dump_dir', help='Dump dir to save outputs', default='/data/zibo/logs/')
+parser.add_argument('--seed_feat_dim', default=512, type=int, help='Point wise feature dim')
+parser.add_argument('--camera', default='realsense', help='Camera split [realsense/kinect]')
+parser.add_argument('--num_point', type=int, default=20000, help='Point Number [default: 15000]')
+parser.add_argument('--batch_size', type=int, default=1, help='Batch Size during inference [default: 1]')
+parser.add_argument('--voxel_size', type=float, default=0.005, help='Voxel Size for sparse convolution')
+parser.add_argument('--collision_thresh', type=float, default=-1,
+                    help='Collision Threshold in collision detection [default: 0.01]')
+parser.add_argument('--voxel_size_cd', type=float, default=0.01, help='Voxel Size for collision detection')
+parser.add_argument('--infer', action='store_true', default=False)
+parser.add_argument('--vis', action='store_true', default=False)
+parser.add_argument('--scene', type=str, default='0109')
+parser.add_argument('--index', type=str, default='0000')
+cfgs = parser.parse_args()
+
+# ------------------------------------------------------------------------- GLOBAL CONFIG BEG
+if not os.path.exists(cfgs.dump_dir):
+    os.mkdir(cfgs.dump_dir)
+
+
+def data_process():
+    root = cfgs.dataset_root
+    camera_type = cfgs.camera
+
+    depth = np.array(Image.open(os.path.join(root, 'scenes', scene_id, camera_type, 'depth', index + '.png')))
+    seg = np.array(Image.open(os.path.join(root, 'scenes', scene_id, camera_type, 'label', index + '.png')))
+    meta = scio.loadmat(os.path.join(root, 'scenes', scene_id, camera_type, 'meta', index + '.mat'))
+    try:
+        intrinsic = meta['intrinsic_matrix']
+        factor_depth = meta['factor_depth']
+    except Exception as e:
+        print(repr(e))
+    camera = CameraInfo(1280.0, 720.0, intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2],
+                        factor_depth)
+    # generate cloud
+    cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
+
+    # get valid points
+    depth_mask = (depth > 0)
+    camera_poses = np.load(os.path.join(root, 'scenes', scene_id, camera_type, 'camera_poses.npy'))
+    align_mat = np.load(os.path.join(root, 'scenes', scene_id, camera_type, 'cam0_wrt_table.npy'))
+    trans = np.dot(align_mat, camera_poses[int(index)])
+    workspace_mask = get_workspace_mask(cloud, seg, trans=trans, organized=True, outlier=0.02)
+    mask = (depth_mask & workspace_mask)
+
+    cloud_masked = cloud[mask]
+
+    # sample points random
+    if len(cloud_masked) >= cfgs.num_point:
+        idxs = np.random.choice(len(cloud_masked), cfgs.num_point, replace=False)
+    else:
+        idxs1 = np.arange(len(cloud_masked))
+        idxs2 = np.random.choice(len(cloud_masked), cfgs.num_point - len(cloud_masked), replace=True)
+        idxs = np.concatenate([idxs1, idxs2], axis=0)
+    cloud_sampled = cloud_masked[idxs]
+
+    ret_dict = {'point_clouds': cloud_sampled.astype(np.float32),
+                'coors': cloud_sampled.astype(np.float32) / cfgs.voxel_size,
+                'feats': np.ones_like(cloud_sampled).astype(np.float32),
+                }
+    return ret_dict
+
+def data_process_fusion():
+    root = cfgs.dataset_root
+    camera_type = cfgs.camera
+    #fusion_data = np.load(os.path.join(root,"fusion_scenes",scene_id,camera_type,"points.npy"),allow_pickle=True).item()
+    #point_cloud = np.array(fusion_data['xyz'])
+    point_cloud = o3d.io.read_point_cloud(os.path.join("../exports/pcd_scene_"+cfgs.scene+"/point_cloud_trans.ply"))
+    ret_dict = {'point_clouds': point_cloud.points,
+                'colors': point_cloud.colors}
+    return ret_dict
+
+
+
+
+if __name__ == '__main__':
+    scene_id = 'scene_' + cfgs.scene
+    index = cfgs.index
+    data_dict = data_process_fusion()
+    pc = data_dict['point_clouds']
+    gg = np.load(os.path.join(cfgs.dump_dir, scene_id, cfgs.camera, cfgs.index + '.npy'))
+    gg = GraspGroup(gg)
+    gg = gg.nms()
+    gg = gg.sort_by_score()
+    print(gg.object_ids)
+    if gg.__len__() > 500:
+        gg = gg[:500]
+    grippers = gg.to_open3d_geometry_list_obj(-1)
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = pc
+    cloud.colors = data_dict['colors']
+    for gripper in grippers:
+        gripper_point_cloud = gripper.sample_points_uniformly(number_of_points=3000)
+        cloud += gripper_point_cloud
+    o3d.io.write_point_cloud("raw_grasps_{}.ply".format(scene_id), cloud)
+    #o3d.visualization.draw([cloud, *grippers])
