@@ -18,5 +18,5 @@ dataset/tolerance
 data3/*
 check*
 *.ply
-grasp*
+#grasp*
 nohup.out
